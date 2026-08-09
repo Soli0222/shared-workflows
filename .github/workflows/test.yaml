@@ -43,6 +43,14 @@ jobs:
           set -euo pipefail
           curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
             | tar xz -C /usr/local/bin actionlint
-          # `concurrency.queue` は actionlint 1.7.12 のスキーマにまだ無い。
-          # publish-chart はこれで chart の採番と publish を排他しているので外せない。
-          actionlint -color -ignore 'unexpected key "queue" for "concurrency" section'
+          # 除外している2件はどちらも actionlint 側のメタデータが追いついていない
+          # だけで、実際には動く。
+          #
+          # - concurrency.queue: 1.7.12 のスキーマにまだ無い。publish-chart は
+          #   これで chart の採番と publish を排他しているので外せない
+          # - create-github-app-token の client-id: actionlint が持っている
+          #   action 定義が app-id しか知らない。client-id は他の全リポジトリの
+          #   renovate workflow で実際に使えている
+          actionlint -color \
+            -ignore 'unexpected key "queue" for "concurrency" section' \
+            -ignore 'actions/create-github-app-token'

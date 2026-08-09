@@ -1,0 +1,49 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'config:recommended',
+  ],
+  timezone: 'Asia/Tokyo',
+  reviewers: [
+    'Soli0222',
+  ],
+  assignees: [
+    'Soli0222',
+  ],
+  semanticCommits: 'enabled',
+  prCreation: 'immediate',
+  rebaseWhen: 'auto',
+  dependencyDashboard: true,
+  vulnerabilityAlerts: {
+    enabled: true,
+    labels: [
+      'security',
+    ],
+  },
+  packageRules: [
+    {
+      matchManagers: [
+        'github-actions',
+      ],
+      commitMessageTopic: 'GitHub Action {{depName}}',
+      // 9リポジトリのリリースパイプラインの実体なので、action の更新は
+      // ケーステストが通っていても自動ではマージしない。
+      automerge: false,
+    },
+  ],
+  customManagers: [
+    {
+      customType: 'regex',
+      managerFilePatterns: [
+        '/^tests/chart-guard/.*\\.sh$/',
+        '/^.github/workflows/test\\.yaml$/',
+      ],
+      matchStrings: [
+        'ACTIONLINT_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)',
+      ],
+      depNameTemplate: 'rhysd/actionlint',
+      datasourceTemplate: 'github-releases',
+      extractVersionTemplate: '^v(?<version>.*)$',
+    },
+  ],
+}

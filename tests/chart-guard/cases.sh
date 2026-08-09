@@ -19,6 +19,16 @@ t "A: appVersion + patch" pass -- \
 t "A: appVersion + minor" fail -- \
   bash -c "yq -i '.appVersion = \"1.0.0\" | .version = \"1.3.0\"' $C/Chart.yaml"
 
+# release-please の extra-files は Chart.yaml を YAML ラウンドトリップで書き戻すので
+# 長い description が折り畳みスカラーに整形し直される。値は同じなので経路 A -> pass
+t "A: appVersion + description reflow" pass -- \
+  bash -c "yq -i '.appVersion = \"1.0.0\"' $C/Chart.yaml; yq -i -P '.description = .description' $C/Chart.yaml; python3 -c \"
+import pathlib
+p = pathlib.Path('$C/Chart.yaml')
+s = p.read_text()
+p.write_text(s.replace('description: guard test', 'description: >-\n  guard\n  test'))
+\""
+
 # 経路 B: image tag + patch -> pass
 t "B: image tag + patch" pass -- \
   bash -c "yq -i '.image.tag = \"1.0.0\"' $C/values.yaml; yq -i '.version = \"1.2.4\"' $C/Chart.yaml"

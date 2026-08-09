@@ -139,21 +139,25 @@ jobs:
               | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' || true
           }
 
-          # Chart.yaml で変更されたトップレベルキーの集合。単純な `key: value` 行
-          # 以外が混ざっていたら構造変更とみなして "?" を返す。
+          # Chart.yaml で「値が」変わったトップレベルキーの集合。
+          #
+          # 行 diff では見られない。release-please の extra-files は Chart.yaml を
+          # YAML のラウンドトリップで書き戻すので、appVersion だけを更新したつもりでも
+          # 長い description が折り畳みスカラー (>-) に整形し直されるなど、値が同じ
+          # ままの行が差分に出る。パースした値どうしを比較する。
+          #
+          # helm package も Chart.yaml を正規化するので、この整形差は梱包物には
+          # 現れない (= reconciler 側では差分にならない)。ここでも同じ扱いにする。
           chart_yaml_keys() {
-            local line keys=()
-            while IFS= read -r line; do
-              line="${line:1}"
-              [[ -z "${line// /}" ]] && continue
-              if [[ "$line" =~ ^([A-Za-z0-9_.-]+): ]]; then
-                keys+=("${BASH_REMATCH[1]}")
-              else
-                echo "?"
-                return
-              fi
-            done < <(changed_lines "${CHART_DIR}/Chart.yaml")
-            printf '%s\n' "${keys[@]+"${keys[@]}"}" | sort -u
+            local head_json base_json
+            head_json=$(yq -o=json "${CHART_DIR}/Chart.yaml")
+            base_json=$(git show "$base:${CHART_DIR}/Chart.yaml" | yq -o=json)
+            jq -rn --argjson head "$head_json" --argjson base "$base_json" '
+              (($head | keys) + ($base | keys))
+              | unique
+              | map(select($head[.] != $base[.]))
+              | .[]
+            '
           }
 
           # values.yaml の変更行が image tag 行だけかどうか。
@@ -186,7 +190,6 @@ jobs:
             required="none"
           elif only_these Chart.yaml values.yaml \
             && values_is_tag_only \
-            && [[ "$chart_keys" != "?" ]] \
             && ! grep -qvE '^(version|appVersion)$' <<< "${chart_keys:-version}"; then
             # 経路 B: renovate が image tag を上げ、bumpVersions が patch を上げる。
             #

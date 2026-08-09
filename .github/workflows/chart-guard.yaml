@@ -118,13 +118,13 @@ jobs:
           IFS='.' read -r hmaj hmin hpat <<< "$head_version"
 
           if [[ "$base_version" == "$head_version" ]]; then
-            bump=none
+            bump="none"
           elif (( hmaj > bmaj )); then
-            bump=major
+            bump="major"
           elif (( hmaj == bmaj && hmin > bmin )); then
-            bump=minor
+            bump="minor"
           elif (( hmaj == bmaj && hmin == bmin && hpat > bpat )); then
-            bump=patch
+            bump="patch"
           else
             echo "::error::chart version が ${base_version} から ${head_version} へ下がっています。"
             exit 1
@@ -171,7 +171,7 @@ jobs:
             # 梱包物の変更が引数で与えたファイル名だけに収まっているか。
             local f allowed=" $* "
             for f in "${packaged_changed[@]}"; do
-              [[ "$allowed" == *" ${f#${CHART_DIR}/} "* ]] || return 1
+              [[ "$allowed" == *" ${f#"${CHART_DIR}"/} "* ]] || return 1
             done
             return 0
           }

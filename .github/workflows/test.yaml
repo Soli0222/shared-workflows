@@ -43,4 +43,6 @@ jobs:
           set -euo pipefail
           curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
             | tar xz -C /usr/local/bin actionlint
-          actionlint -color
+          # `concurrency.queue` は actionlint 1.7.12 のスキーマにまだ無い。
+          # publish-chart はこれで chart の採番と publish を排他しているので外せない。
+          actionlint -color -ignore 'unexpected key "queue" for "concurrency" section'

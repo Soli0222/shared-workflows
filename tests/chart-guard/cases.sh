@@ -6,6 +6,7 @@ C=charts/testchart
 fails=0
 
 t() { bash "$R" "$@" || fails=$((fails + 1)); }
+export CHART_NAME_IN CHART_DIR_IN
 
 # 経路 A: appVersion だけ / version 不変 -> pass
 t "A: appVersion only, version unchanged" pass -- \
@@ -108,6 +109,11 @@ t "template deleted, patch" fail -- \
 # version が下がる -> fail
 t "version downgrade" fail -- \
   bash -c "printf '  # comment\n' >> $C/templates/deployment.yaml; yq -i '.version = \"1.2.2\"' $C/Chart.yaml"
+
+# chart 自体が新規追加された場合は比較対象が無いので version 不問 -> pass
+CHART_NAME_IN=newchart CHART_DIR_IN=charts/newchart \
+t "brand new chart added" pass -- \
+  bash -c "mkdir -p charts/newchart/templates; printf 'apiVersion: v2\nname: newchart\ndescription: new\ntype: application\nversion: 0.3.0\nappVersion: \"1.0.0\"\n' > charts/newchart/Chart.yaml; printf '{}\n' > charts/newchart/values.yaml; printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n' > charts/newchart/templates/cm.yaml"
 
 # chart 外の変更だけ -> pass
 t "no chart change" pass -- \

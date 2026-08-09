@@ -16,7 +16,7 @@ git checkout -q -b pr
 git add -A
 git -c user.email=t@e -c user.name=t commit -qm "$name" --allow-empty
 
-out=$(CHART_NAME_IN="" CHART_DIR_IN="" REPOSITORY="Soli0222/testchart" \
+out=$(CHART_NAME_IN="${CHART_NAME_IN:-}" CHART_DIR_IN="${CHART_DIR_IN:-}" REPOSITORY="Soli0222/testchart" \
       BASE_SHA="$(git rev-parse base)" bash "$HERE/guard.sh" 2>&1)
 rc=$?
 

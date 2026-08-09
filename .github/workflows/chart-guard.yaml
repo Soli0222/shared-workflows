@@ -57,6 +57,12 @@ jobs:
 
           printf 'changed files:\n'; printf '  %s\n' "${changed[@]}"
 
+          # base 側に chart が無い = 新規追加。比較対象が無いので version は不問。
+          if ! git cat-file -e "${base}:${CHART_DIR}/Chart.yaml" 2>/dev/null; then
+            echo "${CHART_DIR} は新規追加なので version は不問です。"
+            exit 0
+          fi
+
           # 梱包される (= .helmignore で落ちない) ファイルの集合を、base 側と
           # head 側の両方を helm package して和集合で求める。削除されたファイルも
           # base 側の package に含まれるので拾える。

@@ -1,0 +1,40 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  chart-guard:
+    name: chart-guard cases
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5.0.1
+
+      - name: Extract the classification script
+        run: tests/chart-guard/extract.sh
+
+      - name: Build the fixture repo
+        run: tests/chart-guard/setup.sh
+
+      - name: Run the cases
+        run: tests/chart-guard/cases.sh
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v7.0.1
+
+      - name: Run actionlint
+        uses: raven-actions/actionlint@v2.0.1

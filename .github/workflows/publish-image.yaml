@@ -1,0 +1,301 @@
+name: Publish Application Image
+
+# 呼び出し専用。共有リポジトリ内でこの workflow を直接 schedule / dispatch すると
+# `github.repository` と `GITHUB_TOKEN` が共有リポジトリを指してしまい、
+# 呼び出し元アプリのソースにも GHCR package にも切り替わらない。
+# 起動経路は必ず各アプリ側に置く。
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: ビルド対象の commit SHA。release-please が返した sha を渡す。
+        required: true
+        type: string
+      version:
+        description: 付与する SemVer タグ (先頭の v は付けない)。
+        required: true
+        type: string
+      image-name:
+        description: "ghcr.io 以下の image 名。既定は呼び出し元リポジトリ (owner/repo) を小文字化したもの。"
+        required: false
+        type: string
+        default: ""
+      context:
+        description: docker build のコンテキスト。
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: Dockerfile のパス (context からの相対ではなくリポジトリルートから)。
+        required: false
+        type: string
+        default: Dockerfile
+      platforms:
+        description: ビルドする platform のカンマ区切りリスト。
+        required: false
+        type: string
+        default: linux/amd64,linux/arm64
+    outputs:
+      image:
+        description: publish した image のリファレンス (タグ付き)。
+        value: ${{ jobs.preflight.outputs.image }}:${{ inputs.version }}
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # 既存の manifest を壊さないための事前判定。
+  #
+  # | 状態                                            | 動作            |
+  # |-------------------------------------------------|-----------------|
+  # | version タグが無い                              | build 開始      |
+  # | タグがあり、期待 platform と revision が一致    | no-op           |
+  # | タグがあり、platform か revision が不一致       | fail (上書き禁止) |
+  #
+  # 「Re-run all jobs」でも通常の publish は再実行される。同じ release SHA でも
+  # ベースイメージの更新で別 digest が生成され得るため、retry 系だけでなく
+  # 通常系にも適用する。
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      build: ${{ steps.inspect.outputs.build }}
+    steps:
+      - name: Resolve image name and build matrix
+        id: resolve
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          PLATFORMS: ${{ inputs.platforms }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          name="${IMAGE_NAME:-$REPOSITORY}"
+          echo "image=${REGISTRY}/${name,,}" >> "$GITHUB_OUTPUT"
+
+          # linux/arm64 だけネイティブ runner を使う。QEMU エミュレーションだと
+          # ビルドが桁違いに遅くなる。
+          matrix=$(
+            tr ',' '\n' <<< "${PLATFORMS}" \
+              | sed '/^[[:space:]]*$/d' \
+              | jq -R -s -c '
+                  split("\n")
+                  | map(select(length > 0) | gsub("^\\s+|\\s+$"; ""))
+                  | map({
+                      platform: .,
+                      runner: (if . == "linux/arm64" then "ubuntu-24.04-arm" else "ubuntu-latest" end),
+                    })
+                '
+          )
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the ghcr.io registry
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Inspect the existing tag
+        id: inspect
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          VERSION: ${{ inputs.version }}
+          PLATFORMS: ${{ inputs.platforms }}
+          EXPECTED_REVISION: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+
+          if ! raw=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .}}' 2>/dev/null); then
+            echo "::notice::${IMAGE}:${VERSION} does not exist yet; building"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          expected=$(tr ',' '\n' <<< "${PLATFORMS}" | sed '/^[[:space:]]*$/d' | tr -d '[:blank:]' | sort -u)
+          # attestation manifest は platform が unknown/unknown になるので除外する。
+          actual=$(
+            jq -r '
+              .manifest.manifests[]
+              | select(.platform.architecture != "unknown")
+              | "\(.platform.os)/\(.platform.architecture)"
+            ' <<< "$raw" | sort -u
+          )
+
+          if [[ "$expected" != "$actual" ]]; then
+            echo "::error::${IMAGE}:${VERSION} already exists with platforms [$(tr '\n' ' ' <<< "$actual")] but [$(tr '\n' ' ' <<< "$expected")] was expected; refusing to overwrite"
+            exit 1
+          fi
+
+          revisions=$(
+            jq -r '.image | to_entries[] | .value.config.Labels["org.opencontainers.image.revision"] // ""' <<< "$raw" \
+              | sort -u
+          )
+          if [[ "$revisions" != "$EXPECTED_REVISION" ]]; then
+            echo "::error::${IMAGE}:${VERSION} already exists at revision [$(tr '\n' ' ' <<< "$revisions")] but [${EXPECTED_REVISION}] was expected; refusing to overwrite"
+            exit 1
+          fi
+
+          echo "::notice::${IMAGE}:${VERSION} is already published for the expected platforms and revision; nothing to do"
+          echo "build=false" >> "$GITHUB_OUTPUT"
+
+  # see https://docs.docker.com/build/ci/github-actions/multi-platform/#distribute-build-across-multiple-runners
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: preflight
+    if: needs.preflight.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    steps:
+      - name: Prepare
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - name: Check out the repo
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.2.0
+
+      # タグと OCI label は event context ではなく inputs から作る。DAG では
+      # `push: main` から呼ばれるため ref は refs/heads/main であり、
+      # `type=semver` のような ref 依存の指定ではタグが作られない。
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ${{ needs.preflight.outputs.image }}
+          tags: type=raw,value=${{ inputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.revision=${{ inputs.ref }}
+
+      - name: Log in to the ghcr.io registry
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7.3.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=image,name=${{ needs.preflight.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Create manifest list
+    needs: [preflight, build]
+    if: needs.preflight.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.2.0
+
+      - name: Log in to the ghcr.io registry
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ needs.preflight.outputs.image }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046
+          docker buildx imagetools create -t "${IMAGE}:${VERSION}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+  # build した場合も no-op だった場合も必ず通る完了条件。
+  # 「version 付き manifest が存在し、期待 platform が全部揃っていて、
+  # revision が一致する」ことをもって image publish の成功とする。
+  verify:
+    name: Verify
+    needs: [preflight, merge]
+    if: always() && needs.preflight.result == 'success' && needs.merge.result != 'failure' && needs.merge.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to the ghcr.io registry
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the published manifest
+        env:
+          IMAGE: ${{ needs.preflight.outputs.image }}
+          VERSION: ${{ inputs.version }}
+          PLATFORMS: ${{ inputs.platforms }}
+          EXPECTED_REVISION: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+
+          raw=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .}}')
+
+          expected=$(tr ',' '\n' <<< "${PLATFORMS}" | sed '/^[[:space:]]*$/d' | tr -d '[:blank:]' | sort -u)
+          actual=$(
+            jq -r '
+              .manifest.manifests[]
+              | select(.platform.architecture != "unknown")
+              | "\(.platform.os)/\(.platform.architecture)"
+            ' <<< "$raw" | sort -u
+          )
+          if [[ "$expected" != "$actual" ]]; then
+            echo "::error::${IMAGE}:${VERSION} has platforms [$(tr '\n' ' ' <<< "$actual")] but [$(tr '\n' ' ' <<< "$expected")] was expected"
+            exit 1
+          fi
+
+          revisions=$(
+            jq -r '.image | to_entries[] | .value.config.Labels["org.opencontainers.image.revision"] // ""' <<< "$raw" \
+              | sort -u
+          )
+          if [[ "$revisions" != "$EXPECTED_REVISION" ]]; then
+            echo "::error::${IMAGE}:${VERSION} is at revision [$(tr '\n' ' ' <<< "$revisions")] but [${EXPECTED_REVISION}] was expected"
+            exit 1
+          fi
+
+          echo "${IMAGE}:${VERSION} verified: platforms [$(tr '\n' ' ' <<< "$actual")], revision ${EXPECTED_REVISION}"

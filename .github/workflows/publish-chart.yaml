@@ -1,0 +1,322 @@
+name: Publish Helm Chart
+
+# 呼び出し専用。共有リポジトリ内でこの workflow を直接 schedule / dispatch すると
+# `github.repository` と `GITHUB_TOKEN` が共有リポジトリを指してしまい、
+# 呼び出し元アプリの chart にも GHCR package にも切り替わらない。
+# 起動経路は必ず各アプリ側に置く。
+on:
+  workflow_call:
+    inputs:
+      chart-name:
+        description: chart の名前。既定は呼び出し元リポジトリ名。
+        required: false
+        type: string
+        default: ""
+      chart-dir:
+        description: chart ディレクトリ。既定は charts/<chart-name>。
+        required: false
+        type: string
+        default: ""
+      oci-repository:
+        description: "publish 先の OCI リポジトリ。既定は oci://ghcr.io/<owner>/charts。"
+        required: false
+        type: string
+        default: ""
+      api-versions:
+        description: helm template に渡す --api-versions (カンマ区切り)。
+        required: false
+        type: string
+        default: ""
+      extra-images:
+        description: |
+          デフォルト値では render されないため helm template から抽出できない image を
+          改行区切りで補う。存在確認の対象に加わる。
+        required: false
+        type: string
+        default: ""
+    outputs:
+      result:
+        description: "published / no-op / deferred のいずれか。"
+        value: ${{ jobs.reconcile.outputs.result }}
+      version:
+        description: publish した chart の version (publish しなかった場合は空)。
+        value: ${{ jobs.reconcile.outputs.version }}
+
+# chart の採番・commit・publish を同時に走らせないための排他。
+# release の順序は保証しない (待機を開始した順に処理される)。既定の `single` は
+# pending を1件しか保持せず破棄するため `max` を使う。古い run は最新の Git と
+# OCI を取り直して no-op に収束する。
+concurrency:
+  group: release-${{ github.repository }}
+  queue: max
+
+jobs:
+  reconcile:
+    name: Reconcile chart
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.reconcile.outputs.result }}
+      version: ${{ steps.reconcile.outputs.version }}
+    steps:
+      # 判定対象の SHA は workflow 内で origin/main を fetch して固定する。
+      # reusable workflow の github.sha は「呼び出し元イベントの SHA」なので、
+      # 排他待ちを終えた後に既定の checkout をするだけでは古い SHA を掴みかねない。
+      - name: Check out main
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5.0.1
+
+      - name: Log in to the ghcr.io registry
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "${GITHUB_TOKEN}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Reconcile
+        id: reconcile
+        env:
+          CHART_NAME_IN: ${{ inputs.chart-name }}
+          CHART_DIR_IN: ${{ inputs.chart-dir }}
+          OCI_REPO_IN: ${{ inputs.oci-repository }}
+          API_VERSIONS: ${{ inputs.api-versions }}
+          EXTRA_IMAGES: ${{ inputs.extra-images }}
+          REPOSITORY: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          CHART_NAME="${CHART_NAME_IN:-${REPOSITORY#*/}}"
+          CHART_DIR="${CHART_DIR_IN:-charts/${CHART_NAME}}"
+          OWNER_LC="${OWNER,,}"
+          OCI_REPO="${OCI_REPO_IN:-oci://ghcr.io/${OWNER_LC}/charts}"
+          # ghcr.io の Distribution API 用のパス (oci:// と host を落としたもの)
+          OCI_PATH="${OCI_REPO#oci://ghcr.io/}/${CHART_NAME}"
+
+          echo "chart=${CHART_NAME} dir=${CHART_DIR} oci=${OCI_REPO}"
+
+          result=deferred
+          published_version=""
+
+          # ---------------------------------------------------------------- utils
+
+          die() { echo "::error::$*"; exit 1; }
+
+          registry_token() {
+            curl -fsSL -u "${ACTOR}:${GITHUB_TOKEN}" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${OCI_PATH}:pull" \
+              | jq -r .token
+          }
+
+          # tags/list は push 直後に反映が遅れることがある。存在確認には使わず、
+          # 「OCI 上の最大 version」を求めるためだけに使う。
+          oci_versions() {
+            local tok
+            tok=$(registry_token)
+            curl -fsSL -H "Authorization: Bearer ${tok}" \
+              "https://ghcr.io/v2/${OCI_PATH}/tags/list" 2>/dev/null \
+              | jq -r '.tags // [] | .[]' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true
+          }
+
+          # 特定 version の存在確認は manifest を直接引く。tags/list の伝播遅延を
+          # 受けない。
+          oci_has_version() {
+            local tok
+            tok=$(registry_token)
+            curl -fsSL -o /dev/null \
+              -H "Authorization: Bearer ${tok}" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+              -H "Accept: application/vnd.oci.image.index.v1+json" \
+              "https://ghcr.io/v2/${OCI_PATH}/manifests/$1" 2>/dev/null
+          }
+
+          # $1 > $2 か。chart version に pre-release は使わない方針なので
+          # x.y.z 前提で比較する。
+          ver_gt() {
+            [[ "$1" == "$2" ]] && return 1
+            [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" == "$1" ]]
+          }
+
+          next_patch() {
+            local major minor patch
+            IFS='.' read -r major minor patch <<< "$1"
+            echo "${major}.${minor}.$((patch + 1))"
+          }
+
+          # chart が deploy する image を全部確認する。values.yaml のキー名検索では
+          # 漏れるため、デフォルト値で helm template した PodSpec の containers と
+          # initContainers から抽出する。条件付きで render されない image は
+          # extra-images で補う。
+          rendered_images() {
+            local args=(template "${CHART_NAME}" "${CHART_DIR}" --namespace default)
+            [[ -n "${API_VERSIONS}" ]] && args+=(--api-versions "${API_VERSIONS}")
+            helm "${args[@]}" | yq -N -r '
+              [ .spec.template.spec,
+                .spec.jobTemplate.spec.template.spec,
+                (select(.kind == "Pod") | .spec) ]
+              | .[] | select(. != null)
+              | (.containers // []) + (.initContainers // [])
+              | .[] | .image
+            '
+            [[ -n "${EXTRA_IMAGES}" ]] && echo "${EXTRA_IMAGES}"
+            return 0
+          }
+
+          # 全部揃っていれば 0、1つでも無ければ 1。
+          images_available() {
+            local img missing=0
+            while read -r img; do
+              [[ -z "$img" ]] && continue
+              if docker buildx imagetools inspect "$img" >/dev/null 2>&1; then
+                echo "  ok      $img"
+              else
+                echo "  MISSING $img"
+                missing=1
+              fi
+            done < <(rendered_images | sort -u)
+            return "$missing"
+          }
+
+          # Git 側の chart と OCI 上の chart を「helm package を通した後の中身」で
+          # 比較する。tgz のバイト比較は gzip のタイムスタンプで再現性が無いため
+          # 使えない。両方を package 済みの形に揃えてから展開して比較する。
+          materialize() {
+            local version="$1" work="$2"
+            rm -rf "$work"
+            mkdir -p "$work/git" "$work/oci" "$work/pkg"
+            helm package "${CHART_DIR}" --destination "$work/pkg" >/dev/null
+            tar xzf "$work/pkg/${CHART_NAME}-${version}.tgz" -C "$work/git"
+            helm pull "${OCI_REPO}/${CHART_NAME}" --version "$version" \
+              --untar --untardir "$work/oci" >/dev/null
+          }
+
+          # ------------------------------------------------------------- reconcile
+          #
+          # 判定は順序に意味がある。「OCI の最大 version > Git の version」と
+          # 「Git の version が OCI に無い」は同時に成立し得るので fail 判定を先に置く。
+          #
+          # | 順 | Git と OCI の状態                      | 動作                    |
+          # |----|----------------------------------------|-------------------------|
+          # | 1  | OCI の最大 version が Git より新しい    | fail                    |
+          # | 2  | Git の version が OCI に無い            | Git の version で publish |
+          # | 3  | OCI にあり、内容が一致                  | no-op                   |
+          # | 4  | OCI にあり、差分が appVersion だけ      | 次の patch → commit → publish |
+          # | 5  | OCI にあり、それ以外が異なる            | fail                    |
+
+          reconcile() {
+            git fetch --quiet origin main
+            git checkout --quiet FETCH_HEAD
+            echo "reconciling at $(git rev-parse --short HEAD)"
+
+            local git_version
+            git_version=$(yq -r '.version' "${CHART_DIR}/Chart.yaml")
+            [[ "$git_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              || die "chart version '${git_version}' is not a plain x.y.z version"
+
+            local max
+            max=$(oci_versions | sort -V | tail -1)
+            echo "git version: ${git_version} / max published: ${max:-<none>}"
+
+            # 1
+            if [[ -n "$max" ]] && ver_gt "$max" "$git_version"; then
+              die "OCI has ${CHART_NAME}-${max} which is newer than the ${git_version} in Git; an out-of-band publish or a missing commit back must be resolved first"
+            fi
+
+            local action publish_version
+            if ! oci_has_version "$git_version"; then
+              # 2
+              action=publish
+              publish_version="$git_version"
+            else
+              local work=/tmp/chart-compare
+              materialize "$git_version" "$work"
+              local a="$work/git/${CHART_NAME}" b="$work/oci/${CHART_NAME}"
+
+              if diff -r "$a" "$b" >/dev/null 2>&1; then
+                # 3
+                echo "${CHART_NAME}-${git_version} is already published with identical contents"
+                result=no-op
+                return 0
+              fi
+
+              if diff -r -x Chart.yaml "$a" "$b" >/dev/null 2>&1 \
+                && diff <(yq -r 'del(.appVersion)' "$a/Chart.yaml") \
+                        <(yq -r 'del(.appVersion)' "$b/Chart.yaml") >/dev/null 2>&1; then
+                # 4
+                action=bump
+                publish_version=$(next_patch "$git_version")
+              else
+                # 5
+                echo "--- differences between Git and ${CHART_NAME}-${git_version} on OCI ---"
+                diff -r "$a" "$b" || true
+                die "${CHART_NAME}-${git_version} is already published with different contents; the chart version must be bumped in the PR (chart-guard should have caught this)"
+              fi
+            fi
+
+            # deploy する image が揃っていなければ何も書かずに撤退する。
+            # 有限時間の待機はしない。release A の chart job が B の image を
+            # 待っている間、B 自身の chart job は同じ concurrency group で後ろに
+            # 詰まるため。後続 run か定期 reconcile に委ねる。
+            echo "verifying the images this chart deploys"
+            if ! images_available; then
+              echo "::warning::image is not available; reconciliation deferred"
+              result=deferred
+              return 0
+            fi
+
+            if [[ "$action" == bump ]]; then
+              echo "bumping chart version ${git_version} -> ${publish_version}"
+              yq -i ".version = \"${publish_version}\"" "${CHART_DIR}/Chart.yaml"
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add "${CHART_DIR}/Chart.yaml"
+              git commit --quiet -m "chore(chart): bump ${CHART_NAME} chart version to ${publish_version}"
+
+              # fast-forward でなければ rebase して続行してはいけない。rebase で
+              # appVersion や chart の内容が変わると、それ以前に行った image 検証と
+              # OCI 比較が無効になる。最初から判定をやり直す。
+              if ! git push --quiet origin HEAD:main; then
+                echo "push was rejected (main moved); restarting the reconciliation"
+                return 3
+              fi
+            fi
+
+            echo "packaging and pushing ${CHART_NAME}-${publish_version}"
+            rm -rf /tmp/dist && mkdir -p /tmp/dist
+            helm package "${CHART_DIR}" --destination /tmp/dist >/dev/null
+            helm push "/tmp/dist/${CHART_NAME}-${publish_version}.tgz" "${OCI_REPO}"
+
+            echo "verifying the pushed chart is resolvable"
+            helm show chart "${OCI_REPO}/${CHART_NAME}" --version "${publish_version}" >/dev/null
+
+            result=published
+            published_version="${publish_version}"
+            return 0
+          }
+
+          for attempt in 1 2 3; do
+            echo "::group::reconcile attempt ${attempt}"
+            set +e
+            reconcile
+            rc=$?
+            set -e
+            echo "::endgroup::"
+            [[ $rc -eq 3 ]] || break
+          done
+
+          if [[ $rc -eq 3 ]]; then
+            die "gave up after 3 attempts because main kept moving under the commit back"
+          fi
+          [[ $rc -eq 0 ]] || exit "$rc"
+
+          echo "result=${result}" >> "$GITHUB_OUTPUT"
+          echo "version=${published_version}" >> "$GITHUB_OUTPUT"
+          echo "::notice::${CHART_NAME}: ${result}${published_version:+ ${published_version}}"

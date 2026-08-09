@@ -1,0 +1,231 @@
+name: Chart Guard
+
+# chart の変更内容と version の上げ方が噛み合っているかを PR で強制する。
+#
+# `patch = イメージが変わっただけ` / `minor・major = 人間が chart の形を変えた`
+# という約束を required check として守らせるためのもの。pke 側はこれを信頼して
+# 自作 chart の patch を automerge する。
+#
+# 呼び出し専用。
+on:
+  workflow_call:
+    inputs:
+      chart-name:
+        description: chart の名前。既定は呼び出し元リポジトリ名。
+        required: false
+        type: string
+        default: ""
+      chart-dir:
+        description: chart ディレクトリ。既定は charts/<chart-name>。
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  guard:
+    name: Guard chart version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5.0.1
+
+      - name: Classify the chart diff
+        env:
+          CHART_NAME_IN: ${{ inputs.chart-name }}
+          CHART_DIR_IN: ${{ inputs.chart-dir }}
+          REPOSITORY: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          CHART_NAME="${CHART_NAME_IN:-${REPOSITORY#*/}}"
+          CHART_DIR="${CHART_DIR_IN:-charts/${CHART_NAME}}"
+
+          base=$(git merge-base "${BASE_SHA}" HEAD)
+          echo "comparing ${base}..HEAD for ${CHART_DIR}"
+
+          mapfile -t changed < <(git diff --name-only "${base}" HEAD -- "${CHART_DIR}")
+          if [[ ${#changed[@]} -eq 0 ]]; then
+            echo "chart に変更はありません。"
+            exit 0
+          fi
+
+          printf 'changed files:\n'; printf '  %s\n' "${changed[@]}"
+
+          # 梱包される (= .helmignore で落ちない) ファイルの集合を、base 側と
+          # head 側の両方を helm package して和集合で求める。削除されたファイルも
+          # base 側の package に含まれるので拾える。
+          packaged_paths() {
+            local rev="$1" work
+            work=$(mktemp -d)
+            git archive "$rev" "${CHART_DIR}" | tar -x -C "$work"
+            helm package "${work}/${CHART_DIR}" --destination "${work}/pkg" >/dev/null
+            tar tzf "${work}"/pkg/*.tgz \
+              | sed -e "s#^${CHART_NAME}/##" -e '/\/$/d' \
+              | sed -e "s#^#${CHART_DIR}/#"
+          }
+
+          # .helmignore 自体は tgz に入らないが、その変更は梱包内容そのものを
+          # 変えるので構造変更として扱う。「常に無視する」にはできない。
+          packaged=$(
+            { packaged_paths "$base"; packaged_paths HEAD; echo "${CHART_DIR}/.helmignore"; } \
+              | sort -u
+          )
+          echo "::group::packaged files"; echo "$packaged"; echo "::endgroup::"
+
+          packaged_changed=()
+          unpackaged_changed=()
+          for f in "${changed[@]}"; do
+            if grep -qxF "$f" <<< "$packaged"; then
+              packaged_changed+=("$f")
+            else
+              unpackaged_changed+=("$f")
+            fi
+          done
+
+          if [[ ${#unpackaged_changed[@]} -gt 0 ]]; then
+            printf 'packaged されないファイル (version 不問):\n'
+            printf '  %s\n' "${unpackaged_changed[@]}"
+          fi
+
+          if [[ ${#packaged_changed[@]} -eq 0 ]]; then
+            echo "梱包されるファイルに変更はありません。version は不問です。"
+            exit 0
+          fi
+
+          printf '梱包物の変更:\n'; printf '  %s\n' "${packaged_changed[@]}"
+
+          # ------------------------------------------------------------- version
+
+          version_at() {
+            git show "$1:${CHART_DIR}/Chart.yaml" | yq -r '.version'
+          }
+          base_version=$(version_at "$base")
+          head_version=$(version_at HEAD)
+          echo "chart version: ${base_version} -> ${head_version}"
+
+          for v in "$base_version" "$head_version"; do
+            [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              || { echo "::error::chart version '${v}' is not a plain x.y.z version"; exit 1; }
+          done
+
+          IFS='.' read -r bmaj bmin bpat <<< "$base_version"
+          IFS='.' read -r hmaj hmin hpat <<< "$head_version"
+
+          if [[ "$base_version" == "$head_version" ]]; then
+            bump=none
+          elif (( hmaj > bmaj )); then
+            bump=major
+          elif (( hmaj == bmaj && hmin > bmin )); then
+            bump=minor
+          elif (( hmaj == bmaj && hmin == bmin && hpat > bpat )); then
+            bump=patch
+          else
+            echo "::error::chart version が ${base_version} から ${head_version} へ下がっています。"
+            exit 1
+          fi
+          echo "bump: ${bump}"
+
+          # --------------------------------------------------------------- 分類
+
+          # 変更行 (ヘッダ行を除く) を取り出す。
+          changed_lines() {
+            git diff -U0 "$base" HEAD -- "$1" \
+              | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' || true
+          }
+
+          # Chart.yaml で変更されたトップレベルキーの集合。単純な `key: value` 行
+          # 以外が混ざっていたら構造変更とみなして "?" を返す。
+          chart_yaml_keys() {
+            local line keys=()
+            while IFS= read -r line; do
+              line="${line:1}"
+              [[ -z "${line// /}" ]] && continue
+              if [[ "$line" =~ ^([A-Za-z0-9_.-]+): ]]; then
+                keys+=("${BASH_REMATCH[1]}")
+              else
+                echo "?"
+                return
+              fi
+            done < <(changed_lines "${CHART_DIR}/Chart.yaml")
+            printf '%s\n' "${keys[@]+"${keys[@]}"}" | sort -u
+          }
+
+          # values.yaml の変更行が image tag 行だけかどうか。
+          values_is_tag_only() {
+            local line
+            while IFS= read -r line; do
+              line="${line:1}"
+              [[ -z "${line// /}" ]] && continue
+              [[ "$line" =~ ^[[:space:]]*tag:[[:space:]] ]] || return 1
+            done < <(changed_lines "${CHART_DIR}/values.yaml")
+            return 0
+          }
+
+          only_these() {
+            # 梱包物の変更が引数で与えたファイル名だけに収まっているか。
+            local f allowed=" $* "
+            for f in "${packaged_changed[@]}"; do
+              [[ "$allowed" == *" ${f#${CHART_DIR}/} "* ]] || return 1
+            done
+            return 0
+          }
+
+          chart_keys=$(chart_yaml_keys)
+
+          route=""
+          if only_these Chart.yaml && [[ "$chart_keys" == "appVersion" ]]; then
+            # 経路 A: release-please が appVersion だけを更新する。
+            # image が変わっただけで chart の中身は変わっていないので version は不変。
+            route="A (appVersion のみ)"
+            required="none"
+          elif only_these Chart.yaml values.yaml \
+            && values_is_tag_only \
+            && [[ "$chart_keys" != "?" ]] \
+            && ! grep -qvE '^(version|appVersion)$' <<< "${chart_keys:-version}"; then
+            # 経路 B: renovate が image tag を上げ、bumpVersions が patch を上げる。
+            #
+            # appVersion と version の patch を同じ PR で動かす形もここに入る
+            # (sui のように release-please を使わず renovate が公開済み image に
+            # 追従するリポジトリの経路)。contract 4 の
+            # `patch = イメージが変わっただけ` に照らして patch は正しい。
+            route="B (image tag のみ)"
+            required="patch"
+          else
+            # 経路 C と catch-all: Chart.yaml の dependencies、Chart.lock、crds/、
+            # files/、subchart、追加の values ファイルなど未分類の梱包物変更は
+            # すべて minor/major 要求に倒す。patch を許可するのは「image tag だけ」と
+            # 構文的に確認できた場合に限る。
+            route="C (chart の構造変更)"
+            required="minor-or-major"
+          fi
+
+          echo "route: ${route} / required bump: ${required}"
+
+          case "$required" in
+            none)
+              if [[ "$bump" != none ]]; then
+                echo "::error::appVersion だけの変更では chart version を上げてはいけません (${base_version} -> ${head_version})。chart の中身は変わっていないためです。"
+                exit 1
+              fi
+              ;;
+            patch)
+              if [[ "$bump" != patch ]]; then
+                echo "::error::image tag の更新には chart version の patch bump が必要です (現在: ${bump}, ${base_version} -> ${head_version})。"
+                exit 1
+              fi
+              ;;
+            minor-or-major)
+              if [[ "$bump" != minor && "$bump" != major ]]; then
+                echo "::error::chart の構造が変わっています。version は minor または major を上げてください (現在: ${bump}, ${base_version} -> ${head_version})。pke はこの約束を信頼して patch を automerge するため、patch では通しません。"
+                exit 1
+              fi
+              ;;
+          esac
+
+          echo "OK: ${route} に対して ${bump} bump は妥当です。"

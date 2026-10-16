@@ -3,6 +3,7 @@
   extends: [
     'config:recommended',
   ],
+  pinDigests: false,
   timezone: 'Asia/Tokyo',
   reviewers: [
     'Soli0222',

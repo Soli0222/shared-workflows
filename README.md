@@ -18,7 +18,9 @@ GHCR package にも chart にも切り替わらない。
 したがって**ここに置く workflow は `on: workflow_call` のみ**とし、
 起動経路 (push / schedule / dispatch / pull_request) は各アプリ側に置く。
 
-呼び出しは `@<sha>` で pin する。
+呼び出しは `@vX.Y.Z` のバージョンタグで固定する。
+検証済みのコミットに新しいタグを付けて公開し、公開済みのタグは移動しない。
+呼び出し元のタグ更新は Renovate が PR にする。
 
 ## workflow
 
@@ -37,7 +39,7 @@ publish-image:
   permissions:
     contents: read
     packages: write
-  uses: Soli0222/shared-workflows/.github/workflows/publish-image.yaml@<sha>
+  uses: Soli0222/shared-workflows/.github/workflows/publish-image.yaml@v1.0.1
   with:
     ref: ${{ needs.release-please.outputs.sha }}
     version: ${{ needs.release-please.outputs.version }}
@@ -105,7 +107,7 @@ publish-chart:
   permissions:
     contents: write
     packages: write
-  uses: Soli0222/shared-workflows/.github/workflows/publish-chart.yaml@<sha>
+  uses: Soli0222/shared-workflows/.github/workflows/publish-chart.yaml@v1.0.1
   with:
     api-versions: monitoring.coreos.com/v1
 ```
@@ -134,7 +136,7 @@ required check として強制する。pke 側はこれを信頼して自作 cha
 
 ```yaml
 chart-guard:
-  uses: Soli0222/shared-workflows/.github/workflows/chart-guard.yaml@<sha>
+  uses: Soli0222/shared-workflows/.github/workflows/chart-guard.yaml@v1.0.1
 ```
 
 ## テスト

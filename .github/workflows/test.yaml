@@ -54,3 +54,11 @@ jobs:
           actionlint -color \
             -ignore 'unexpected key "queue" for "concurrency" section' \
             -ignore 'actions/create-github-app-token'
+
+  publish-chart:
+    name: Default branch reconciliation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: azure/setup-helm@v5.0.1
+      - run: python3 tests/publish-chart/cases.py

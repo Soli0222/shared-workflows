@@ -27,7 +27,7 @@ GHCR package にも chart にも切り替わらない。
 | workflow | 役割 |
 |---|---|
 | `publish-image.yaml` | multi-arch image を build して `ghcr.io` へ publish する |
-| `publish-chart.yaml` | main 上の chart を `oci://ghcr.io/<owner>/charts` へ収束させる (調停処理) |
+| `publish-chart.yaml` | 呼び出し元の既定ブランチ上の chart を `oci://ghcr.io/<owner>/charts` へ収束させる (調停処理) |
 | `chart-guard.yaml` | PR の chart 変更と version の上げ方が噛み合っているかを検査する |
 
 ### `publish-image.yaml`
@@ -67,7 +67,7 @@ publish-image:
 ### `publish-chart.yaml`
 
 **特定のアプリ release に対応する chart を作る処理ではない。**
-image publish 成功を契機として、**main 上の最新 chart を OCI へ収束させる**処理である。
+image publish 成功を契機として、**呼び出し元の既定ブランチ上の最新 chart を OCI へ収束させる**処理である。
 連続した release の中間 version は、後続 release に包含されて chart が個別に作られない
 場合がある。
 

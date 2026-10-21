@@ -58,13 +58,13 @@ jobs:
       result: ${{ steps.reconcile.outputs.result }}
       version: ${{ steps.reconcile.outputs.version }}
     steps:
-      # 判定対象の SHA は workflow 内で origin/main を fetch して固定する。
+      # 判定対象の SHA は workflow 内で 呼び出し元の既定ブランチ を fetch して固定する。
       # reusable workflow の github.sha は「呼び出し元イベントの SHA」なので、
       # 排他待ちを終えた後に既定の checkout をするだけでは古い SHA を掴みかねない。
-      - name: Check out main
+      - name: Check out the default branch
         uses: actions/checkout@v7.0.1
         with:
-          ref: main
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
       - name: Set up Helm
@@ -88,6 +88,7 @@ jobs:
           EXTRA_IMAGES: ${{ inputs.extra-images }}
           REPOSITORY: ${{ github.repository }}
           OWNER: ${{ github.repository_owner }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -212,7 +213,7 @@ jobs:
           # | 5  | OCI にあり、それ以外が異なる            | fail                    |
 
           reconcile() {
-            git fetch --quiet origin main
+            git fetch --quiet origin "$DEFAULT_BRANCH"
             git checkout --quiet FETCH_HEAD
             echo "reconciling at $(git rev-parse --short HEAD)"
 
@@ -283,8 +284,8 @@ jobs:
               # fast-forward でなければ rebase して続行してはいけない。rebase で
               # appVersion や chart の内容が変わると、それ以前に行った image 検証と
               # OCI 比較が無効になる。最初から判定をやり直す。
-              if ! git push --quiet origin HEAD:main; then
-                echo "push was rejected (main moved); restarting the reconciliation"
+              if ! git push --quiet origin "HEAD:refs/heads/$DEFAULT_BRANCH"; then
+                echo "push was rejected (default branch moved); restarting the reconciliation"
                 return 3
               fi
             fi
@@ -313,7 +314,7 @@ jobs:
           done
 
           if [[ $rc -eq 3 ]]; then
-            die "gave up after 3 attempts because main kept moving under the commit back"
+            die "gave up after 3 attempts because default branch kept moving under the commit back"
           fi
           [[ $rc -eq 0 ]] || exit "$rc"
 

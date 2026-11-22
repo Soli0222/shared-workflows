@@ -304,8 +304,10 @@ jobs:
 Go バイナリを GitHub Release へ公開する。`tag` input に
 `inputs.tag || github.ref_name` を渡す。`go-version` を指定しない場合は
 `go-version-file` (既定 `go.mod`) を参照する。`app-token: true` で
-RENOVATE App token を `APP_TOKEN` env に載せる (brews の tap push 用、
+GitHub App token を `APP_TOKEN` env に載せる (brews の tap push 用、
 `extra-token-repositories` で push 先リポジトリを追加スコープする)。
+secrets は `APP_ID`/`PRIVATE_KEY` を優先し、無ければ
+`RENOVATE_CLIENT_ID`/`RENOVATE_PRIVATE_KEY` にフォールバックする。
 
 呼び出し元の `release.yaml`:
 

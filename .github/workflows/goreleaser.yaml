@@ -24,8 +24,10 @@ on:
         default: "go.mod"
       app-token:
         description: |
-          RENOVATE_CLIENT_ID/RENOVATE_PRIVATE_KEY から GitHub App token を
-          生成し APP_TOKEN env で goreleaser に渡す (brews: の tap push 用)。
+          GitHub App token を生成し APP_TOKEN env で goreleaser に渡す
+          (brews: の tap push 用)。secrets は APP_ID/PRIVATE_KEY があればそれを
+          優先し、無ければ RENOVATE_CLIENT_ID/RENOVATE_PRIVATE_KEY に
+          フォールバックする。
         required: false
         type: boolean
         default: false
@@ -67,8 +69,8 @@ jobs:
         uses: actions/create-github-app-token@v3.4.0
         with:
           repositories: ${{ github.event.repository.name }}${{ inputs.extra-token-repositories != '' && format(',{0}', inputs.extra-token-repositories) || '' }}
-          client-id: ${{ secrets.RENOVATE_CLIENT_ID }}
-          private-key: ${{ secrets.RENOVATE_PRIVATE_KEY }}
+          app-id: ${{ secrets.APP_ID || secrets.RENOVATE_CLIENT_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY || secrets.RENOVATE_PRIVATE_KEY }}
           permission-contents: write
 
       - name: Set up Go

@@ -29,6 +29,13 @@ jobs:
       - name: Run the cases
         run: bash tests/chart-guard/cases.sh
 
+  weekly-merge:
+    name: weekly-merge cases
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: python3 tests/weekly-merge/cases.py
+
   actionlint:
     name: actionlint
     runs-on: ubuntu-latest

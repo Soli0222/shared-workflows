@@ -1,0 +1,104 @@
+name: Weekly Release PR Merge
+
+# 呼び出し専用。起動経路 (schedule / workflow_dispatch) は各アプリ側の
+# weekly-release.yaml に置く。reusable workflow の `github` context は
+# 呼び出し元アプリのものになる。secrets (RENOVATE_CLIENT_ID /
+# RENOVATE_PRIVATE_KEY) は呼び出し側が `secrets: inherit` で渡す。
+#
+# 各リポジトリに分散していた週次 release-please PR 自動マージの共通化版。
+# 実装の差分 (ブランチ名の判定) によってマージされない PR が生じたため、
+# 判定は呼び出し元の既定ブランチから導出してリポジトリ非依存にした。
+on:
+  workflow_call:
+
+jobs:
+  merge:
+    name: Merge only the checked release PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3.4.0
+        with:
+          repositories: ${{ github.event.repository.name }}
+          client-id: ${{ secrets.RENOVATE_CLIENT_ID }}
+          private-key: ${{ secrets.RENOVATE_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: read
+          permission-statuses: read
+
+      - name: Merge only the checked release PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # manifest モードの release-please ブランチは
+          # release-please--branches--<base>--components--<component>。
+          # component は release-type によって空になる (go 等) ため、
+          # suffix あり・なしの両方を対象にする。
+          branch_prefix="release-please--branches--${BASE_BRANCH}"
+
+          prs="$(gh pr list --repo "${GITHUB_REPOSITORY}" \
+            --base "${BASE_BRANCH}" --label 'autorelease: pending' \
+            --state open --json number,headRefName,isDraft,author)"
+
+          candidates="$(echo "${prs}" | jq --arg app "${RELEASE_APP_SLUG}" \
+            --arg prefix "${branch_prefix}" '
+            [.[] | select(
+              .isDraft == false
+              and .author.is_bot == true
+              and (((.author.login // "")
+                     | sub("^app/"; "") | sub("\\[bot\\]$"; "")) == $app)
+              and (.headRefName == $prefix
+                   or (.headRefName | startswith($prefix + "--components--")))
+            )]')"
+
+          count="$(echo "${candidates}" | jq 'length')"
+          if [ "${count}" -gt 1 ]; then
+            echo "Multiple release PRs found; refusing to select one." >&2
+            exit 1
+          fi
+          if [ "${count}" -eq 0 ]; then
+            echo "No pending release-please PR."
+            exit 0
+          fi
+
+          number="$(echo "${candidates}" | jq -r '.[0].number')"
+          echo "Pending release PR: #${number}"
+
+          view="$(gh pr view "${number}" --repo "${GITHUB_REPOSITORY}" \
+            --json headRefOid,statusCheckRollup,mergeStateStatus)"
+
+          # 「CI required」が存在して SUCCESS、他の check もすべて
+          # SUCCESS / NEUTRAL / SKIPPED で完了している場合に限る。
+          if ! echo "${view}" | jq -e '
+              ((.statusCheckRollup // [])
+                | [.[] | select(.name == "CI required")]
+                | length > 0
+                  and all(.[]; .status == "COMPLETED" and .conclusion == "SUCCESS"))
+              and ((.statusCheckRollup // []) | all(.[]?;
+                  if has("status") then
+                    .status == "COMPLETED"
+                      and (.conclusion == "SUCCESS"
+                           or .conclusion == "NEUTRAL"
+                           or .conclusion == "SKIPPED")
+                  else
+                    .state == "SUCCESS"
+                  end))
+            ' >/dev/null; then
+            echo "Release PR is not ready with successful CI; leaving it open."
+            exit 0
+          fi
+          if [ "$(echo "${view}" | jq -r '.mergeStateStatus')" != "CLEAN" ]; then
+            echo "Release PR is not ready with successful CI; leaving it open."
+            exit 0
+          fi
+
+          # 検証した head SHA を指定し、検証後に更新された PR はマージしない。
+          gh pr merge "${number}" --repo "${GITHUB_REPOSITORY}" \
+            --squash --match-head-commit "$(echo "${view}" | jq -r '.headRefOid')"

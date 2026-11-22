@@ -1,0 +1,127 @@
+name: Publish Helm Chart
+
+# chart 単独の変更 (renovate の third-party image 追従など) と、定期的な調停の
+# 起動経路。アプリのリリース経由の chart publish は release-pipeline.yaml の
+# DAG が行う。
+#
+# 呼び出し専用。起動経路 (push: charts/**, schedule, workflow_dispatch) は
+# 各アプリ側に置く。
+on:
+  workflow_call:
+    inputs:
+      chart-name:
+        description: chart の名前。既定は呼び出し元リポジトリ名。
+        required: false
+        type: string
+        default: ""
+      chart-dir:
+        description: chart ディレクトリ。既定は charts/<chart-name>。
+        required: false
+        type: string
+        default: ""
+      oci-repository:
+        description: "publish 先の OCI リポジトリ。既定は oci://ghcr.io/<owner>/charts。"
+        required: false
+        type: string
+        default: ""
+      api-versions:
+        description: helm template に渡す --api-versions (カンマ区切り)。
+        required: false
+        type: string
+        default: ""
+      extra-images:
+        description: |
+          デフォルト値では render されないため helm template から抽出できない image を
+          改行区切りで補う。存在確認の対象に加わる。
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  # release-please の PR には Chart.yaml の appVersion 更新が含まれ、そのマージで
+  # GitHub Release 作成より前に charts/** の push trigger が発火する。これが
+  # 順序逆転の正体なので、appVersion だけの変更では publish を起動しない。
+  # その変更は release-pipeline.yaml の DAG が image 成功後に処理する。
+  triage:
+    name: Triage the push
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.triage.outputs.run }}
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether to reconcile
+        id: triage
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT" != push ]]; then
+            echo "${EVENT} は常に reconcile する"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "before (${BEFORE}) を解決できないので reconcile する"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t changed < <(git diff --name-only "$BEFORE" "$AFTER" -- charts)
+          printf 'changed under charts/:\n'; printf '  %s\n' "${changed[@]}"
+
+          # charts/ 直下で変わったのが Chart.yaml だけで、しかもその変更行が
+          # appVersion だけなら、release-pipeline 側に任せて何もしない。
+          if [[ ${#changed[@]} -eq 1 && "${changed[0]}" =~ ^charts/[^/]+/Chart\.yaml$ ]]; then
+            others=$(
+              git diff -U0 "$BEFORE" "$AFTER" -- "${changed[0]}" \
+                | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' \
+                | sed 's/^.//' \
+                | grep -vE '^\s*$' \
+                | grep -vE '^appVersion:' || true
+            )
+            if [[ -z "$others" ]]; then
+              echo "appVersion だけの変更なので release-pipeline の DAG に任せる"
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+  publish-chart:
+    name: Publish Helm Chart
+    needs: triage
+    if: needs.triage.outputs.run == 'true'
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/publish-chart.yaml
+    secrets: inherit
+    with:
+      chart-name: ${{ inputs.chart-name }}
+      chart-dir: ${{ inputs.chart-dir }}
+      oci-repository: ${{ inputs.oci-repository }}
+      api-versions: ${{ inputs.api-versions }}
+      extra-images: ${{ inputs.extra-images }}
+
+  report:
+    name: Report chart result
+    needs: publish-chart
+    if: needs.publish-chart.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULT: ${{ needs.publish-chart.outputs.result }}
+          VERSION: ${{ needs.publish-chart.outputs.version }}
+        run: echo "Chart result=$RESULT version=$VERSION" >> "$GITHUB_STEP_SUMMARY"

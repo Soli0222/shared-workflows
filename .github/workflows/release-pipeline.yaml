@@ -1,0 +1,201 @@
+name: Release Pipeline
+
+# アプリのリリース1回分を1つの run で表す DAG。
+# release-please → image publish → chart publish を needs で繋ぐ。
+#
+# 以前は release-please と image build と chart publish が別イベントで起動する
+# 並列 run に分かれており、chart が image を最大10分 polling して待っていた。
+# image build が10分を超えると chart は失敗したままになり、image を rerun しても
+# chart は再起動しなかった。
+#
+# 呼び出し専用。起動経路 (push: <default branch>, workflow_dispatch) は
+# 各アプリ側に置く。
+on:
+  workflow_call:
+    inputs:
+      # ---- release-please 用ツールチェイン (psr-node など repo 内のリリースツール
+      # が必要な場合だけ使う) ----
+      release-tools-prefix:
+        description: |
+          release-please の前に `npm ci --ignore-scripts --prefix` を実行する
+          ディレクトリ。空ならツールインストールを行わない (例: scripts/release)。
+        required: false
+        type: string
+        default: ""
+      node-version:
+        description: |
+          release-tools-prefix を使う場合の Node.js バージョン。
+          空なら setup-node を入れない。
+        required: false
+        type: string
+        default: ""
+      # ---- release-image.yaml への転送 ----
+      image-name:
+        description: "ghcr.io 以下の image 名。既定は呼び出し元リポジトリ名。"
+        required: false
+        type: string
+        default: ""
+      context:
+        description: docker build のコンテキスト。
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: Dockerfile のパス。
+        required: false
+        type: string
+        default: Dockerfile
+      platforms:
+        description: ビルドする platform のカンマ区切りリスト。
+        required: false
+        type: string
+        default: linux/amd64,linux/arm64
+      version-check-command:
+        description: publish 前に実行する版数検証コマンド。空なら検証しない。
+        required: false
+        type: string
+        default: ""
+      advance-latest:
+        description: 安定版リリースのとき ghcr latest タグを進めるか。
+        required: false
+        type: boolean
+        default: false
+      # ---- publish-chart.yaml への転送 ----
+      chart-name:
+        description: chart の名前。既定は呼び出し元リポジトリ名。
+        required: false
+        type: string
+        default: ""
+      chart-dir:
+        description: chart ディレクトリ。既定は charts/<chart-name>。
+        required: false
+        type: string
+        default: ""
+      oci-repository:
+        description: "publish 先の OCI リポジトリ。既定は oci://ghcr.io/<owner>/charts。"
+        required: false
+        type: string
+        default: ""
+      api-versions:
+        description: helm template に渡す --api-versions (カンマ区切り)。
+        required: false
+        type: string
+        default: ""
+      extra-images:
+        description: |
+          デフォルト値では render されないため helm template から抽出できない image を
+          改行区切りで補う。存在確認の対象に加わる。
+        required: false
+        type: string
+        default: ""
+    outputs:
+      release-created:
+        description: release-please が GitHub Release を作ったか。
+        value: ${{ jobs.release-please.outputs.release-created }}
+      version:
+        description: 作成されたリリースの版数 (v なし)。
+        value: ${{ jobs.release-please.outputs.version }}
+      sha:
+        description: リリースされた commit SHA。
+        value: ${{ jobs.release-please.outputs.sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release-created: ${{ steps.release.outputs.release_created }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - name: Check out the repo
+        if: inputs.release-tools-prefix != ''
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        if: inputs.release-tools-prefix != '' && inputs.node-version != ''
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install release tools
+        if: inputs.release-tools-prefix != ''
+        run: npm ci --ignore-scripts --prefix "${{ inputs.release-tools-prefix }}"
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3.4.0
+        with:
+          repositories: ${{ github.event.repository.name }}
+          client-id: ${{ secrets.RENOVATE_CLIENT_ID }}
+          private-key: ${{ secrets.RENOVATE_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Release Please
+        id: release
+        uses: googleapis/release-please-action@v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          token: ${{ steps.app-token.outputs.token }}
+
+  publish-image:
+    name: Publish Application Image
+    needs: release-please
+    if: needs.release-please.outputs.release-created == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release-image.yaml
+    secrets: inherit
+    with:
+      ref: ${{ needs.release-please.outputs.sha }}
+      version: ${{ needs.release-please.outputs.version }}
+      image-name: ${{ inputs.image-name }}
+      context: ${{ inputs.context }}
+      dockerfile: ${{ inputs.dockerfile }}
+      platforms: ${{ inputs.platforms }}
+      version-check-command: ${{ inputs.version-check-command }}
+      advance-latest: ${{ inputs.advance-latest }}
+
+  # image が publish できてから chart を動かす。chart は「この release の chart」を
+  # 作るのではなく、main 上の最新 chart を OCI へ収束させる調停処理なので inputs に
+  # release の version は渡さない。release-please が release を作らなかった run
+  # では publish-image が skip され、ここも skip になる。
+  publish-chart:
+    name: Publish Helm Chart
+    needs: [release-please, publish-image]
+    if: needs.publish-image.result == 'success'
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/publish-chart.yaml
+    secrets: inherit
+    with:
+      chart-name: ${{ inputs.chart-name }}
+      chart-dir: ${{ inputs.chart-dir }}
+      oci-repository: ${{ inputs.oci-repository }}
+      api-versions: ${{ inputs.api-versions }}
+      extra-images: ${{ inputs.extra-images }}
+
+  report-chart:
+    name: Report chart result
+    needs: publish-chart
+    if: needs.publish-chart.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULT: ${{ needs.publish-chart.outputs.result }}
+          VERSION: ${{ needs.publish-chart.outputs.version }}
+        run: echo "Chart result=$RESULT version=$VERSION" >> "$GITHUB_STEP_SUMMARY"

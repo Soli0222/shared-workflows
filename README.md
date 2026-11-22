@@ -30,6 +30,11 @@ GHCR package にも chart にも切り替わらない。
 | `publish-chart.yaml` | 呼び出し元の既定ブランチ上の chart を `oci://ghcr.io/<owner>/charts` へ収束させる (調停処理) |
 | `chart-guard.yaml` | PR の chart 変更と version の上げ方が噛み合っているかを検査する |
 | `weekly-merge.yaml` | release-please の pending PR を CI 成功を条件に squash merge する |
+| `release-image.yaml` | version-check → `publish-image` → latest タグ前進をまとめる |
+| `release-pipeline.yaml` | release-please → `release-image` → `publish-chart` のリリース DAG |
+| `release-retry.yaml` | 既存リリース版数から sha を解決して image / chart publish をやり直す |
+| `chart-release.yaml` | charts/** への push / 定期実行から appVersion-only 変化を捌いて `publish-chart` を呼ぶ |
+| `goreleaser.yaml` | タグ push / dispatch から GoReleaser でバイナリを公開する |
 
 ### `publish-image.yaml`
 
@@ -178,6 +183,153 @@ jobs:
       statuses: read
     uses: Soli0222/shared-workflows/.github/workflows/weekly-merge.yaml@v1.2.0
     secrets: inherit
+```
+
+### `release-pipeline.yaml`
+
+各リポジトリに分散していたリリース DAG の共通化版。
+`push: <既定ブランチ>` から起動し、release-please → image publish → chart publish を
+1 run でつなぐ。RENOVATE 系 secrets は呼び出し元から `secrets: inherit` で渡す。
+
+- `version-check-command` … publish 前の版数検証 (例: sui/hokan の `make version-check`)。
+- `advance-latest` … 安定版リリースで `ghcr.io/<repo>:latest` を進める。
+- `platforms` / `image-name` / `context` / `dockerfile` … `publish-image` に転送。
+- `chart-name` / `chart-dir` / `oci-repository` / `api-versions` / `extra-images` … `publish-chart` に転送。
+- `release-tools-prefix` + `node-version` … release-please 前に `npm ci` する
+  リポジトリ (psr-node 系) 用。
+
+呼び出し元の `release.yaml` はこれだけあればよい:
+
+```yaml
+name: Release Pipeline
+on:
+  push:
+    branches: [main] # summaly は master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-pipeline-${{ github.repository }}
+  queue: max
+
+jobs:
+  release:
+    permissions:
+      contents: write
+      pull-requests: write
+      packages: write
+    uses: Soli0222/shared-workflows/.github/workflows/release-pipeline.yaml@v1.3.0
+    secrets: inherit
+    with:
+      api-versions: monitoring.coreos.com/v1 # chart で CRD を使うリポジトリだけ
+```
+
+### `release-image.yaml`
+
+`publish-image` の前後にリリース固有の補助 (任意の `version-check-command` と
+`advance-latest`) を付けた薄いラッパー。`release-pipeline` / `release-retry` から
+呼ばれるほか、repo 独自の起動経路から直接呼んでもよい。
+
+### `release-retry.yaml`
+
+既存リリースに対して image / chart publish だけをやり直す。
+tag → sha の解決は workflow 内の vendored script が行う。
+
+呼び出し元の `release-retry.yaml`:
+
+```yaml
+name: Retry Release Publish
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing release version without v (including RC versions)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  retry:
+    permissions:
+      contents: write
+      pull-requests: write
+      packages: write
+    uses: Soli0222/shared-workflows/.github/workflows/release-retry.yaml@v1.3.0
+    secrets: inherit
+    with:
+      version: ${{ inputs.version }}
+      version-check-command: 'make version-check VERSION="$VERSION"'
+      advance-latest: true
+```
+
+### `chart-release.yaml`
+
+`push: charts/**` / 定期実行 / dispatch の起動経路と、release-please の
+appVersion-only push を捌く triage をまとめたもの。triage は vendored bash で、
+per-repo の Python 実装と同じ判定 (Chart.yaml 1 ファイル・appVersion 行のみの
+変更は DAG 側に任せる)。
+
+呼び出し元の `chart-release.yaml`:
+
+```yaml
+name: Publish Helm Chart
+on:
+  push:
+    branches: [main]
+    paths: ['charts/**']
+  schedule:
+    - cron: '17 19 * * *' # Daily 04:17 JST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    permissions:
+      contents: write
+      packages: write
+    uses: Soli0222/shared-workflows/.github/workflows/chart-release.yaml@v1.3.0
+    secrets: inherit
+    with:
+      api-versions: monitoring.coreos.com/v1
+```
+
+### `goreleaser.yaml`
+
+Go バイナリを GitHub Release へ公開する。`tag` input に
+`inputs.tag || github.ref_name` を渡す。`go-version` を指定しない場合は
+`go-version-file` (既定 `go.mod`) を参照する。`app-token: true` で
+RENOVATE App token を `APP_TOKEN` env に載せる (brews の tap push 用、
+`extra-token-repositories` で push 先リポジトリを追加スコープする)。
+
+呼び出し元の `release.yaml`:
+
+```yaml
+name: goreleaser
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing published release tag to publish binaries for'
+        required: true
+        type: string
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    uses: Soli0222/shared-workflows/.github/workflows/goreleaser.yaml@v1.3.0
+    secrets: inherit
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
 ```
 
 ## テスト

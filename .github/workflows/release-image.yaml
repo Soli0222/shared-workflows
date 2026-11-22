@@ -1,0 +1,125 @@
+name: Publish Release Image
+
+# publish-image の前後にある、リリース固有の補助処理をまとめた呼び出し専用
+# workflow。
+#
+# - version-check: タグ付け前に repo 側の規約 (package.json 等の版数) を確認する。
+#   コマンドは呼び出し元が inputs で渡す (例: `make version-check VERSION="$VERSION"`)。
+# - latest: 安定版リリースだけ `ghcr.io/<repo>:latest` を進める。
+#
+# どちらも任意で、両方無ければ publish-image の呼び出しと等価。
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: ビルド対象の commit SHA。release-please か resolve が返した sha。
+        required: true
+        type: string
+      version:
+        description: 付与する SemVer タグ (先頭の v は付けない)。
+        required: true
+        type: string
+      image-name:
+        description: "ghcr.io 以下の image 名。既定は呼び出し元リポジトリ名。"
+        required: false
+        type: string
+        default: ""
+      context:
+        description: docker build のコンテキスト。
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: Dockerfile のパス。
+        required: false
+        type: string
+        default: Dockerfile
+      platforms:
+        description: ビルドする platform のカンマ区切りリスト。
+        required: false
+        type: string
+        default: linux/amd64,linux/arm64
+      version-check-command:
+        description: |
+          publish 前に実行する版数検証コマンド。$VERSION にリリース版数が入る。
+          空なら検証しない (例: "make version-check VERSION=\"$VERSION\"")。
+        required: false
+        type: string
+        default: ""
+      advance-latest:
+        description: 安定版リリースのとき ghcr latest タグを進めるか。
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-image-${{ github.repository }}
+  queue: max
+
+jobs:
+  version-check:
+    name: Check released versions
+    if: inputs.version-check-command != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Check released package versions
+        env:
+          VERSION: ${{ inputs.version }}
+        run: ${{ inputs.version-check-command }}
+
+  publish:
+    name: Publish Application Image
+    needs: version-check
+    if: needs.version-check.result == 'success' || needs.version-check.result == 'skipped'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-image.yaml
+    secrets: inherit
+    with:
+      ref: ${{ inputs.ref }}
+      version: ${{ inputs.version }}
+      image-name: ${{ inputs.image-name }}
+      context: ${{ inputs.context }}
+      dockerfile: ${{ inputs.dockerfile }}
+      platforms: ${{ inputs.platforms }}
+
+  latest:
+    name: Update latest stable image
+    needs: publish
+    if: inputs.advance-latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/login-action@v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Advance latest only for the current stable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            echo "Prereleases do not update latest."
+            exit 0
+          fi
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          if [[ "$latest" != "$RELEASE_VERSION" ]]; then
+            echo "Release $RELEASE_VERSION is not the latest stable release; leaving latest unchanged."
+            exit 0
+          fi
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker buildx imagetools create -t "${image}:latest" "${image}:${RELEASE_VERSION}"

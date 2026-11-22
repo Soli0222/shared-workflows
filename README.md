@@ -29,6 +29,7 @@ GHCR package にも chart にも切り替わらない。
 | `publish-image.yaml` | multi-arch image を build して `ghcr.io` へ publish する |
 | `publish-chart.yaml` | 呼び出し元の既定ブランチ上の chart を `oci://ghcr.io/<owner>/charts` へ収束させる (調停処理) |
 | `chart-guard.yaml` | PR の chart 変更と version の上げ方が噛み合っているかを検査する |
+| `weekly-merge.yaml` | release-please の pending PR を CI 成功を条件に squash merge する |
 
 ### `publish-image.yaml`
 
@@ -139,6 +140,46 @@ chart-guard:
   uses: Soli0222/shared-workflows/.github/workflows/chart-guard.yaml@v1.0.1
 ```
 
+### `weekly-merge.yaml`
+
+各リポジトリに分散していた週次 release-please PR 自動マージの共通化版。
+起動経路 (schedule / workflow_dispatch) と RENOVATE 系 secrets は呼び出し元側。
+
+ブランチ判定は `release-please--branches--<既定ブランチ>` または
+その `--components--<component>` 付きのものに限定する (manifest モードで
+release-type: node 等は component がブランチ名に入るため両方必要)。
+あわせて `autorelease: pending` ラベル、draft 以外、`RELEASE_APP_SLUG`
+(App token の slug) と一致する bot 作者であることを要求する。
+`CI required` の SUCCESS・他 check の完了・`mergeStateStatus == CLEAN` を
+確認してから、検証した head SHA を pin して squash merge する。
+
+呼び出し元の `weekly-release.yaml` はこれだけあればよい:
+
+```yaml
+name: Weekly Release PR Merge
+on:
+  schedule:
+    - cron: '0 22 * * 6' # Sunday 07:00 JST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      statuses: read
+    uses: Soli0222/shared-workflows/.github/workflows/weekly-merge.yaml@v1.2.0
+    secrets: inherit
+```
+
 ## テスト
 
 `chart-guard` の分類は 9 リポジトリの required check になるので、
@@ -146,8 +187,12 @@ chart-guard:
 テストは workflow YAML から実行スクリプトを抜き出して動かすので、
 **CI が実際に流すコードそのもの**を検証する。
 
+`weekly-merge` の候補選択と CI gate も `tests/weekly-merge/cases.py` で
+workflow から抜き出したスクリプトを stub した `gh` で実走させて検証する。
+
 ```console
 $ tests/chart-guard/extract.sh
 $ tests/chart-guard/setup.sh
 $ tests/chart-guard/cases.sh
+$ python3 tests/weekly-merge/cases.py
 ```

@@ -1,0 +1,135 @@
+name: Retry Release Publish
+
+# 既存の GitHub Release に対して image / chart publish だけをやり直す
+# 呼び出し専用 workflow。起動経路は各アプリ側の workflow_dispatch に置き、
+# inputs.version (v なし) を受け取って渡す。
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 既存のリリース版数 (v なし、RC 可)。
+        required: true
+        type: string
+      # ---- release-image.yaml への転送 ----
+      image-name:
+        description: "ghcr.io 以下の image 名。既定は呼び出し元リポジトリ名。"
+        required: false
+        type: string
+        default: ""
+      context:
+        description: docker build のコンテキスト。
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: Dockerfile のパス。
+        required: false
+        type: string
+        default: Dockerfile
+      platforms:
+        description: ビルドする platform のカンマ区切りリスト。
+        required: false
+        type: string
+        default: linux/amd64,linux/arm64
+      version-check-command:
+        description: publish 前に実行する版数検証コマンド。空なら検証しない。
+        required: false
+        type: string
+        default: ""
+      advance-latest:
+        description: 安定版リリースのとき ghcr latest タグを進めるか。
+        required: false
+        type: boolean
+        default: false
+      # ---- publish-chart.yaml への転送 ----
+      chart-name:
+        description: chart の名前。既定は呼び出し元リポジトリ名。
+        required: false
+        type: string
+        default: ""
+      chart-dir:
+        description: chart ディレクトリ。既定は charts/<chart-name>。
+        required: false
+        type: string
+        default: ""
+      oci-repository:
+        description: "publish 先の OCI リポジトリ。既定は oci://ghcr.io/<owner>/charts。"
+        required: false
+        type: string
+        default: ""
+      api-versions:
+        description: helm template に渡す --api-versions (カンマ区切り)。
+        required: false
+        type: string
+        default: ""
+      extra-images:
+        description: |
+          デフォルト値では render されないため helm template から抽出できない image を
+          改行区切りで補う。存在確認の対象に加わる。
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve the released commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: resolve
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] \
+            || { echo 'Use an existing SemVer release without a v prefix.' >&2; exit 1; }
+
+          release=$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft)
+          jq -e --arg version "$VERSION" '.tagName == $version and .isDraft == false' <<< "$release" >/dev/null
+          sha=$(git rev-parse --verify "refs/tags/${VERSION}^{commit}")
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  publish-image:
+    name: Publish Application Image
+    needs: resolve
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release-image.yaml
+    secrets: inherit
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      version: ${{ inputs.version }}
+      image-name: ${{ inputs.image-name }}
+      context: ${{ inputs.context }}
+      dockerfile: ${{ inputs.dockerfile }}
+      platforms: ${{ inputs.platforms }}
+      version-check-command: ${{ inputs.version-check-command }}
+      advance-latest: ${{ inputs.advance-latest }}
+
+  publish-chart:
+    name: Publish Helm Chart
+    needs: [resolve, publish-image]
+    if: needs.publish-image.result == 'success'
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/publish-chart.yaml
+    secrets: inherit
+    with:
+      chart-name: ${{ inputs.chart-name }}
+      chart-dir: ${{ inputs.chart-dir }}
+      oci-repository: ${{ inputs.oci-repository }}
+      api-versions: ${{ inputs.api-versions }}
+      extra-images: ${{ inputs.extra-images }}

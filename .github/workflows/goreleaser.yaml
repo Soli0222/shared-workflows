@@ -1,0 +1,98 @@
+name: goreleaser
+
+# Go バイナリの GitHub Release 公開。呼び出し専用。
+# 起動経路 (push: tags 'v*', workflow_dispatch: tag) は各アプリ側に置き、
+# `tag` input に `inputs.tag || github.ref_name` を渡す。
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 公開する既存のタグ (v 付き)。
+        required: true
+        type: string
+      go-version:
+        description: |
+          使う Go のバージョン。go-version-file と併用不可。
+          両方空なら go.mod を参照する。
+        required: false
+        type: string
+        default: ""
+      go-version-file:
+        description: Go のバージョンを読むファイル。既定は go.mod。
+        required: false
+        type: string
+        default: "go.mod"
+      app-token:
+        description: |
+          GitHub App token を生成し APP_TOKEN env で goreleaser に渡す
+          (brews: の tap push 用)。secrets は APP_ID/PRIVATE_KEY があればそれを
+          優先し、無ければ RENOVATE_CLIENT_ID/RENOVATE_PRIVATE_KEY に
+          フォールバックする。
+        required: false
+        type: boolean
+        default: false
+      extra-token-repositories:
+        description: |
+          app-token 生成時に追加でスコープするリポジトリ名 (カンマ区切り、
+          owner なし)。brews の push 先など。
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    name: goreleaser
+    runs-on: ubuntu-latest
+    env:
+      GORELEASER_CURRENT_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Validate published release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GORELEASER_CURRENT_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq 'if .isDraft then error("Release is a draft") else "Published release exists" end'
+
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          ref: refs/tags/${{ inputs.tag }}
+
+      - name: Generate GitHub App token
+        if: inputs.app-token
+        id: app-token
+        uses: actions/create-github-app-token@v3.4.0
+        with:
+          repositories: ${{ github.event.repository.name }}${{ inputs.extra-token-repositories != '' && format(',{0}', inputs.extra-token-repositories) || '' }}
+          app-id: ${{ secrets.APP_ID || secrets.RENOVATE_CLIENT_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY || secrets.RENOVATE_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Set up Go
+        if: inputs.go-version != ''
+        uses: actions/setup-go@v7.1.0
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: true
+
+      - name: Set up Go
+        if: inputs.go-version == ''
+        uses: actions/setup-go@v7.1.0
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7.3.0
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}

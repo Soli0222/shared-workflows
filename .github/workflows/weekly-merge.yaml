@@ -13,12 +13,13 @@ on:
     inputs:
       required-checks:
         description: |
-          成功していなければマージしない check の名前 (改行かカンマ区切り)。
-          列挙したすべてが存在し、SUCCESS で完了している必要がある。
-          それ以外の check も SUCCESS / NEUTRAL / SKIPPED で完了している必要がある。
+          追加で必須にする check の名前 (改行かカンマ区切り)。列挙した check は
+          存在し、SUCCESS で完了している必要がある。空なら追加の条件は無い。
+          指定の有無にかかわらず、check が1つ以上あり、すべて SUCCESS / NEUTRAL /
+          SKIPPED で完了していることを要求する。
         required: false
         type: string
-        default: CI required
+        default: ""
 
 jobs:
   merge:
@@ -50,10 +51,6 @@ jobs:
           required="$(printf '%s\n' "${REQUIRED_CHECKS}" | tr ',' '\n' \
             | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' \
             | jq -R . | jq -s -c .)"
-          if [ "$(echo "${required}" | jq 'length')" -eq 0 ]; then
-            echo "required-checks is empty; refusing to merge without a required check." >&2
-            exit 1
-          fi
 
           # manifest モードの release-please ブランチは
           # release-please--branches--<base>--components--<component>。
@@ -92,30 +89,53 @@ jobs:
           view="$(gh pr view "${number}" --repo "${GITHUB_REPOSITORY}" \
             --json headRefOid,statusCheckRollup,mergeStateStatus)"
 
-          # required-checks がすべて存在して SUCCESS、他の check もすべて
-          # SUCCESS / NEUTRAL / SKIPPED で完了している場合に限る。
-          if ! echo "${view}" | jq -e --argjson required "${required}" '
-              (.statusCheckRollup // []) as $checks
-              | all($required[]; . as $name
-                  | [$checks[] | select(.name == $name)]
-                  | length > 0
-                    and all(.[]; .status == "COMPLETED" and .conclusion == "SUCCESS"))
-              and ($checks | all(.[]?;
-                  if has("status") then
-                    .status == "COMPLETED"
-                      and (.conclusion == "SUCCESS"
-                           or .conclusion == "NEUTRAL"
-                           or .conclusion == "SKIPPED")
-                  else
-                    .state == "SUCCESS"
-                  end))
-            ' >/dev/null; then
-            echo "Release PR is not ready with successful CI; leaving it open."
+          # マージしないときは理由を warning と Step Summary に残す。
+          # run は成功のままにする (CI が正当に失敗しているときに通知が増えないように)。
+          leave_open() {
+            echo "::warning::Release PR #${number} is not ready ($1); leaving it open."
+            printf 'Release PR #%s was not merged: %s\n' "${number}" "$1" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
             exit 0
+          }
+
+          # check run は name / status / conclusion を、commit status は
+          # context / state を持つ。
+          checks="$(echo "${view}" | jq -c '.statusCheckRollup // []
+            | map({
+                name: (.name // .context // ""),
+                done: (if has("status") then .status == "COMPLETED" else .state != "PENDING" and .state != "EXPECTED" end),
+                result: (if has("status") then (.conclusion // "") else (.state // "") end)
+              })')"
+
+          # check が1つも無いときはマージしない (CI がまだ始まっていない可能性がある)。
+          if [ "$(echo "${checks}" | jq 'length')" -eq 0 ]; then
+            leave_open "no checks have been reported"
           fi
-          if [ "$(echo "${view}" | jq -r '.mergeStateStatus')" != "CLEAN" ]; then
-            echo "Release PR is not ready with successful CI; leaving it open."
-            exit 0
+
+          missing="$(echo "${checks}" | jq -r --argjson required "${required}" '
+            [.[].name] as $names
+            | [$required[] | select(. as $n | $names | index($n) | not)]
+            | join(", ")')"
+          if [ -n "${missing}" ]; then
+            leave_open "required checks not found: ${missing}"
+          fi
+
+          # すべての check が完了して SUCCESS / NEUTRAL / SKIPPED であること。
+          # required-checks に挙げた check は SUCCESS に限る。
+          not_ready="$(echo "${checks}" | jq -r --argjson required "${required}" '
+            [.[] | select(
+                (.done | not)
+                or (if (.name | IN($required[])) then .result != "SUCCESS"
+                    else (.result | IN("SUCCESS", "NEUTRAL", "SKIPPED") | not) end))
+              | "\(.name)=\(if .done then .result else "PENDING" end)"]
+            | join(", ")')"
+          if [ -n "${not_ready}" ]; then
+            leave_open "checks not successful: ${not_ready}"
+          fi
+
+          merge_state="$(echo "${view}" | jq -r '.mergeStateStatus')"
+          if [ "${merge_state}" != "CLEAN" ]; then
+            leave_open "merge state is ${merge_state}"
           fi
 
           # 検証した head SHA を指定し、検証後に更新された PR はマージしない。

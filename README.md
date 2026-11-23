@@ -155,11 +155,11 @@ chart-guard:
 release-type: node 等は component がブランチ名に入るため両方必要)。
 あわせて `autorelease: pending` ラベル、draft 以外、`RELEASE_APP_SLUG`
 (App token の slug) と一致する bot 作者であることを要求する。
-`required-checks` に列挙した check (既定は `CI required`、改行かカンマ区切り) が
-すべて SUCCESS であること・他 check の完了・`mergeStateStatus == CLEAN` を
-確認してから、検証した head SHA を pin して squash merge する。
-`CI required` という集約 job を持たないリポジトリは、必須にしたい check の名前を渡す
-(例: `required-checks: test,lint`)。
+check が1つ以上あり、すべて SUCCESS / NEUTRAL / SKIPPED で完了していること・
+`mergeStateStatus == CLEAN` を確認してから、検証した head SHA を pin して squash merge する。
+特定の check を必須にしたいときは `required-checks` に名前を渡す (改行かカンマ区切り。
+例: `required-checks: CI required`)。列挙した check は存在し、SUCCESS である必要がある。
+マージしなかったときは理由を warning と Step Summary に残す (run は成功のまま)。
 
 呼び出し元の `weekly-release.yaml` はこれだけあればよい:
 

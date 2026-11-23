@@ -155,8 +155,11 @@ chart-guard:
 release-type: node 等は component がブランチ名に入るため両方必要)。
 あわせて `autorelease: pending` ラベル、draft 以外、`RELEASE_APP_SLUG`
 (App token の slug) と一致する bot 作者であることを要求する。
-`CI required` の SUCCESS・他 check の完了・`mergeStateStatus == CLEAN` を
+`required-checks` に列挙した check (既定は `CI required`、改行かカンマ区切り) が
+すべて SUCCESS であること・他 check の完了・`mergeStateStatus == CLEAN` を
 確認してから、検証した head SHA を pin して squash merge する。
+`CI required` という集約 job を持たないリポジトリは、必須にしたい check の名前を渡す
+(例: `required-checks: test,lint`)。
 
 呼び出し元の `weekly-release.yaml` はこれだけあればよい:
 
@@ -343,10 +346,18 @@ jobs:
 
 `weekly-merge` の候補選択と CI gate も `tests/weekly-merge/cases.py` で
 workflow から抜き出したスクリプトを stub した `gh` で実走させて検証する。
+`publish-chart` の調停も同様に `tests/publish-chart/cases.py` で、OCI だけを stub して
+Git と Helm は実物で動かす (レジストリのエラーや push の失敗で止まることも確認する)。
+
+`tests/job-conditions/cases.py` は、`needs.<job>.result == 'skipped'` を見る job の `if` に
+ステータス関数 (`!cancelled()` など) が付いているかを静的に検査する。付いていないと
+暗黙の `success() &&` によって needs が skipped のときに job が黙って skip される。
 
 ```console
 $ tests/chart-guard/extract.sh
 $ tests/chart-guard/setup.sh
 $ tests/chart-guard/cases.sh
 $ python3 tests/weekly-merge/cases.py
+$ python3 tests/publish-chart/cases.py
+$ python3 tests/job-conditions/cases.py
 ```

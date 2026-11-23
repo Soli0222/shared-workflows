@@ -195,8 +195,10 @@ jobs:
           platforms: ${{ matrix.platform }}
           provenance: false
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # platform ごとに scope を分ける。分けないと並列の build が同じ scope を
+          # 書き換え合い、もう一方の platform のキャッシュが効かなくなる。
+          cache-from: type=gha,scope=publish-image-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=publish-image-${{ env.PLATFORM_PAIR }}
           outputs: type=image,name=${{ needs.preflight.outputs.image }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest

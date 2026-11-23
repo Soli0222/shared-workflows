@@ -46,7 +46,7 @@ def script():
 
 
 class WeeklyMergeTest(unittest.TestCase):
-    def run_merge(self, prs, view=READY_VIEW):
+    def run_merge(self, prs, view=READY_VIEW, required_checks="CI required"):
         tmp = self.tmp
         gh = Path(tmp) / "bin" / "gh"
         gh.parent.mkdir(parents=True, exist_ok=True)
@@ -63,6 +63,7 @@ class WeeklyMergeTest(unittest.TestCase):
             "GH_STUB_VIEW": json.dumps(view),
             "GH_MERGED_LOG": str(merged_log),
             "GH_TOKEN": "x",
+            "REQUIRED_CHECKS": required_checks,
         })
         proc = subprocess.run(
             ["bash", "-c", script()], text=True, capture_output=True, env=env)
@@ -138,6 +139,47 @@ class WeeklyMergeTest(unittest.TestCase):
         proc, log = self.run_merge([BOT_PR], view)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(self.merged(log))
+
+    def test_custom_required_checks_merge(self):
+        view = dict(READY_VIEW, statusCheckRollup=[
+            {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        proc, log = self.run_merge([BOT_PR], view, required_checks="test, lint")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.merged(log), proc.stdout)
+
+    def test_newline_separated_required_checks_merge(self):
+        view = dict(READY_VIEW, statusCheckRollup=[
+            {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        proc, log = self.run_merge([BOT_PR], view, required_checks="test\nlint\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.merged(log), proc.stdout)
+
+    def test_one_of_custom_required_checks_missing_leaves_open(self):
+        view = dict(READY_VIEW, statusCheckRollup=[
+            {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        proc, log = self.run_merge([BOT_PR], view, required_checks="test,lint")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.merged(log))
+        self.assertIn("leaving it open", proc.stdout)
+
+    def test_pending_required_check_leaves_open(self):
+        view = dict(READY_VIEW, statusCheckRollup=[
+            {"name": "CI required", "status": "IN_PROGRESS", "conclusion": ""},
+        ])
+        proc, log = self.run_merge([BOT_PR], view)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.merged(log))
+
+    def test_empty_required_checks_refused(self):
+        proc, log = self.run_merge([BOT_PR], required_checks=" , ")
+        self.assertEqual(proc.returncode, 1)
+        self.assertFalse(self.merged(log))
+        self.assertIn("required-checks is empty", proc.stderr)
 
     def test_dirty_merge_state_leaves_open(self):
         view = dict(READY_VIEW, mergeStateStatus="BEHIND")

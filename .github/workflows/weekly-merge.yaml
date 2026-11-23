@@ -10,6 +10,15 @@ name: Weekly Release PR Merge
 # 判定は呼び出し元の既定ブランチから導出してリポジトリ非依存にした。
 on:
   workflow_call:
+    inputs:
+      required-checks:
+        description: |
+          成功していなければマージしない check の名前 (改行かカンマ区切り)。
+          列挙したすべてが存在し、SUCCESS で完了している必要がある。
+          それ以外の check も SUCCESS / NEUTRAL / SKIPPED で完了している必要がある。
+        required: false
+        type: string
+        default: CI required
 
 jobs:
   merge:
@@ -34,8 +43,17 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           RELEASE_APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          REQUIRED_CHECKS: ${{ inputs.required-checks }}
         run: |
           set -euo pipefail
+
+          required="$(printf '%s\n' "${REQUIRED_CHECKS}" | tr ',' '\n' \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' \
+            | jq -R . | jq -s -c .)"
+          if [ "$(echo "${required}" | jq 'length')" -eq 0 ]; then
+            echo "required-checks is empty; refusing to merge without a required check." >&2
+            exit 1
+          fi
 
           # manifest モードの release-please ブランチは
           # release-please--branches--<base>--components--<component>。
@@ -74,14 +92,15 @@ jobs:
           view="$(gh pr view "${number}" --repo "${GITHUB_REPOSITORY}" \
             --json headRefOid,statusCheckRollup,mergeStateStatus)"
 
-          # 「CI required」が存在して SUCCESS、他の check もすべて
+          # required-checks がすべて存在して SUCCESS、他の check もすべて
           # SUCCESS / NEUTRAL / SKIPPED で完了している場合に限る。
-          if ! echo "${view}" | jq -e '
-              ((.statusCheckRollup // [])
-                | [.[] | select(.name == "CI required")]
-                | length > 0
-                  and all(.[]; .status == "COMPLETED" and .conclusion == "SUCCESS"))
-              and ((.statusCheckRollup // []) | all(.[]?;
+          if ! echo "${view}" | jq -e --argjson required "${required}" '
+              (.statusCheckRollup // []) as $checks
+              | all($required[]; . as $name
+                  | [$checks[] | select(.name == $name)]
+                  | length > 0
+                    and all(.[]; .status == "COMPLETED" and .conclusion == "SUCCESS"))
+              and ($checks | all(.[]?;
                   if has("status") then
                     .status == "COMPLETED"
                       and (.conclusion == "SUCCESS"

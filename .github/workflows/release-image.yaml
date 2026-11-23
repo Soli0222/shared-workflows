@@ -80,7 +80,10 @@ jobs:
   publish:
     name: Publish Application Image
     needs: version-check
-    if: needs.version-check.result == 'success' || needs.version-check.result == 'skipped'
+    # ステータス関数の無い if には暗黙に `success() &&` が付き、needs が skipped だと
+    # false になる。version-check を使わない (= skipped) 呼び出し元でも publish する
+    # ために !cancelled() を明示する。
+    if: ${{ !cancelled() && (needs.version-check.result == 'success' || needs.version-check.result == 'skipped') }}
     permissions:
       contents: read
       packages: write

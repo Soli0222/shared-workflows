@@ -108,7 +108,8 @@ jobs:
 
           # ---------------------------------------------------------------- utils
 
-          die() { echo "::error::$*"; exit 1; }
+          # $(...) の中から呼ばれても理由がログに残るよう stderr に出す。
+          die() { echo "::error::$*" >&2; exit 1; }
 
           registry_token() {
             curl -fsSL -u "${ACTOR}:${GITHUB_TOKEN}" \
@@ -116,27 +117,55 @@ jobs:
               | jq -r .token
           }
 
+          # 未作成のパッケージに対して ghcr.io は 404 ではなく 401/403 を返す
+          # (token の取得自体も失敗する)。
+          #
           # tags/list は push 直後に反映が遅れることがある。存在確認には使わず、
-          # 「OCI 上の最大 version」を求めるためだけに使う。
+          # 「OCI 上の最大 version」を求めるためだけに使う。401/403/404 は
+          # 「公開済みの version が無い」とみなし、それ以外のエラーでは止める。
           oci_versions() {
-            local tok
-            tok=$(registry_token)
-            curl -fsSL -H "Authorization: Bearer ${tok}" \
-              "https://ghcr.io/v2/${OCI_PATH}/tags/list" 2>/dev/null \
-              | jq -r '.tags // [] | .[]' \
-              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true
+            local tok code body
+            tok=$(registry_token) || tok=""
+            body=$(mktemp)
+            code=$(curl -sS -o "$body" -w '%{http_code}' \
+              -H "Authorization: Bearer ${tok}" \
+              "https://ghcr.io/v2/${OCI_PATH}/tags/list") \
+              || die "failed to list the tags of ${OCI_PATH}"
+            case "$code" in
+              200)
+                jq -r '.tags // [] | .[]' "$body" \
+                  | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true
+                ;;
+              401|403|404) ;;
+              *) die "unexpected HTTP status ${code} when listing the tags of ${OCI_PATH}" ;;
+            esac
           }
 
           # 特定 version の存在確認は manifest を直接引く。tags/list の伝播遅延を
           # 受けない。
+          #
+          # 「無い」と判定すると Git の version で push するので、判定できない
+          # ときに「無い」へ倒すと公開済みの version を上書きしてしまう。
+          # 404 か、公開済みの version が1つも無いとき ($2 が空) の 401/403
+          # だけを「無い」とし、それ以外は止める。
           oci_has_version() {
-            local tok
-            tok=$(registry_token)
-            curl -fsSL -o /dev/null \
+            local tok code
+            tok=$(registry_token) || tok=""
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
               -H "Authorization: Bearer ${tok}" \
               -H "Accept: application/vnd.oci.image.manifest.v1+json" \
               -H "Accept: application/vnd.oci.image.index.v1+json" \
-              "https://ghcr.io/v2/${OCI_PATH}/manifests/$1" 2>/dev/null
+              "https://ghcr.io/v2/${OCI_PATH}/manifests/$1") \
+              || die "failed to look up ${CHART_NAME}-$1 on OCI"
+            case "$code" in
+              200) return 0 ;;
+              404) return 1 ;;
+              401|403)
+                [[ -z "$2" ]] && return 1
+                die "HTTP ${code} when looking up ${CHART_NAME}-$1 on OCI, although other versions are published"
+                ;;
+              *) die "unexpected HTTP status ${code} when looking up ${CHART_NAME}-$1 on OCI" ;;
+            esac
           }
 
           # $1 > $2 か。chart version に pre-release は使わない方針なので
@@ -166,14 +195,18 @@ jobs:
               | .[] | select(. != null)
               | (.containers // []) + (.initContainers // [])
               | .[] | .image
-            '
+            ' || return 1
             [[ -n "${EXTRA_IMAGES}" ]] && echo "${EXTRA_IMAGES}"
             return 0
           }
 
           # 全部揃っていれば 0、1つでも無ければ 1。
+          # render に失敗したときに「確認する image が無い = 揃っている」と
+          # みなさないよう、一覧を先に取り出してから確認する。
           images_available() {
-            local img missing=0
+            local img images missing=0
+            images=$(rendered_images | sort -u) \
+              || die "failed to render ${CHART_DIR} to find the images it deploys"
             while read -r img; do
               [[ -z "$img" ]] && continue
               if docker buildx imagetools inspect "$img" >/dev/null 2>&1; then
@@ -182,7 +215,7 @@ jobs:
                 echo "  MISSING $img"
                 missing=1
               fi
-            done < <(rendered_images | sort -u)
+            done <<< "$images"
             return "$missing"
           }
 
@@ -193,10 +226,13 @@ jobs:
             local version="$1" work="$2"
             rm -rf "$work"
             mkdir -p "$work/git" "$work/oci" "$work/pkg"
-            helm package "${CHART_DIR}" --destination "$work/pkg" >/dev/null
-            tar xzf "$work/pkg/${CHART_NAME}-${version}.tgz" -C "$work/git"
+            helm package "${CHART_DIR}" --destination "$work/pkg" >/dev/null \
+              || die "failed to package ${CHART_DIR}"
+            tar xzf "$work/pkg/${CHART_NAME}-${version}.tgz" -C "$work/git" \
+              || die "failed to extract the packaged ${CHART_NAME}-${version}"
             helm pull "${OCI_REPO}/${CHART_NAME}" --version "$version" \
-              --untar --untardir "$work/oci" >/dev/null
+              --untar --untardir "$work/oci" >/dev/null \
+              || die "failed to pull ${CHART_NAME}-${version} from OCI"
           }
 
           # ------------------------------------------------------------- reconcile
@@ -211,10 +247,13 @@ jobs:
           # | 3  | OCI にあり、内容が一致                  | no-op                   |
           # | 4  | OCI にあり、差分が appVersion だけ      | 次の patch → commit → publish |
           # | 5  | OCI にあり、それ以外が異なる            | fail                    |
+          #
+          # reconcile は戻り値 3 (やり直し) を受け取るために set +e で呼ぶので、
+          # 中では errexit が効かない。失敗し得るコマンドには明示的に die を付ける。
 
           reconcile() {
-            git fetch --quiet origin "$DEFAULT_BRANCH"
-            git checkout --quiet FETCH_HEAD
+            git fetch --quiet origin "$DEFAULT_BRANCH" || die "failed to fetch ${DEFAULT_BRANCH}"
+            git checkout --quiet FETCH_HEAD || die "failed to check out ${DEFAULT_BRANCH}"
             echo "reconciling at $(git rev-parse --short HEAD)"
 
             local git_version
@@ -223,7 +262,7 @@ jobs:
               || die "chart version '${git_version}' is not a plain x.y.z version"
 
             local max
-            max=$(oci_versions | sort -V | tail -1)
+            max=$(oci_versions | sort -V | tail -1) || exit 1
             echo "git version: ${git_version} / max published: ${max:-<none>}"
 
             # 1
@@ -232,7 +271,9 @@ jobs:
             fi
 
             local action publish_version
-            if ! oci_has_version "$git_version"; then
+            # oci_has_version は判定できないと die するが、if の条件の中では
+            # $(...) と違ってその exit がそのまま効く。
+            if ! oci_has_version "$git_version" "$max"; then
               # 2
               action=publish
               publish_version="$git_version"
@@ -275,11 +316,13 @@ jobs:
 
             if [[ "$action" == bump ]]; then
               echo "bumping chart version ${git_version} -> ${publish_version}"
-              yq -i ".version = \"${publish_version}\"" "${CHART_DIR}/Chart.yaml"
+              yq -i ".version = \"${publish_version}\"" "${CHART_DIR}/Chart.yaml" \
+                || die "failed to update the chart version"
               git config user.name "github-actions[bot]"
               git config user.email "github-actions[bot]@users.noreply.github.com"
-              git add "${CHART_DIR}/Chart.yaml"
-              git commit --quiet -m "chore(chart): bump ${CHART_NAME} chart version to ${publish_version}"
+              git add "${CHART_DIR}/Chart.yaml" || die "failed to stage the chart version bump"
+              git commit --quiet -m "chore(chart): bump ${CHART_NAME} chart version to ${publish_version}" \
+                || die "failed to commit the chart version bump"
 
               # fast-forward でなければ rebase して続行してはいけない。rebase で
               # appVersion や chart の内容が変わると、それ以前に行った image 検証と
@@ -292,11 +335,14 @@ jobs:
 
             echo "packaging and pushing ${CHART_NAME}-${publish_version}"
             rm -rf /tmp/dist && mkdir -p /tmp/dist
-            helm package "${CHART_DIR}" --destination /tmp/dist >/dev/null
-            helm push "/tmp/dist/${CHART_NAME}-${publish_version}.tgz" "${OCI_REPO}"
+            helm package "${CHART_DIR}" --destination /tmp/dist >/dev/null \
+              || die "failed to package ${CHART_DIR}"
+            helm push "/tmp/dist/${CHART_NAME}-${publish_version}.tgz" "${OCI_REPO}" \
+              || die "failed to push ${CHART_NAME}-${publish_version} to ${OCI_REPO}"
 
             echo "verifying the pushed chart is resolvable"
-            helm show chart "${OCI_REPO}/${CHART_NAME}" --version "${publish_version}" >/dev/null
+            helm show chart "${OCI_REPO}/${CHART_NAME}" --version "${publish_version}" >/dev/null \
+              || die "${CHART_NAME}-${publish_version} was pushed but cannot be resolved"
 
             result=published
             published_version="${publish_version}"

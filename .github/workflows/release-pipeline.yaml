@@ -142,13 +142,31 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
 
-      - name: Release Please
-        id: release
+      # release-tools-prefix があれば repo 内ツール (psr-node fork など、
+      # upstream action が知らない strategy を実装する) で実行する。
+      - name: Release Please (release-please-action)
+        id: release-action
+        if: inputs.release-tools-prefix == ''
         uses: googleapis/release-please-action@v5.0.0
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           token: ${{ steps.app-token.outputs.token }}
+
+      - name: Release Please (repo release tools)
+        id: release-custom
+        if: inputs.release-tools-prefix != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: npm run release --prefix "${{ inputs.release-tools-prefix }}"
+
+      - name: Collect release outputs
+        id: release
+        env:
+          CREATED: ${{ steps.release-action.outputs.release_created || steps.release-custom.outputs.release_created }}
+          VERSION: ${{ steps.release-action.outputs.version || steps.release-custom.outputs.version }}
+          SHA: ${{ steps.release-action.outputs.sha || steps.release-custom.outputs.sha }}
+        run: printf 'release_created=%s\nversion=%s\nsha=%s\n' "$CREATED" "$VERSION" "$SHA" >> "$GITHUB_OUTPUT"
 
   publish-image:
     name: Publish Application Image
